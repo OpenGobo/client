@@ -12,9 +12,11 @@
   "app": {
     "windows": [
       {
-        "title": "client",
-        "width": 800,
-        "height": 600
+        "title": "OpenGobo Startup",
+        "width": 420,
+        "height": 320,
+        "resizable": false,
+        "center": true
       }
     ],
     "security": {
