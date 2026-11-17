@@ -33,6 +33,10 @@ impl Default for ClientRuntimeStatus {
     }
 }
 
+fn read_state(state: &State<'_, Mutex<ClientRuntimeStatus>>) -> ClientRuntimeStatus {
+    state.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
 fn update_and_emit(
     app: &AppHandle,
     state: &State<'_, Mutex<ClientRuntimeStatus>>,
@@ -47,7 +51,7 @@ fn update_and_emit(
 
 #[tauri::command]
 fn get_runtime_status(state: State<'_, Mutex<ClientRuntimeStatus>>) -> ClientRuntimeStatus {
-    state.lock().map(|s| s.clone()).unwrap_or_default()
+    read_state(&state)
 }
 
 #[tauri::command]
@@ -56,13 +60,13 @@ fn discover_servers() -> Result<Vec<DiscoveredServer>, String> {
 }
 
 #[tauri::command]
-fn connect_server(
+async fn connect_server(
     app: AppHandle,
     host: String,
     port: u16,
     state: State<'_, Mutex<ClientRuntimeStatus>>,
 ) -> Result<ClientRuntimeStatus, String> {
-    let hello = discovery::probe_server(&host, port)?;
+    let hello = discovery::probe_server(&host, port).await?;
     let next = ClientRuntimeStatus {
         protocol_version: PROTOCOL_VERSION,
         connected: true,
@@ -75,14 +79,14 @@ fn connect_server(
 }
 
 #[tauri::command]
-fn complete_setup(
+async fn complete_setup(
     app: AppHandle,
     setup_pin: String,
     admin_username: String,
     admin_password: String,
     state: State<'_, Mutex<ClientRuntimeStatus>>,
 ) -> Result<ClientRuntimeStatus, String> {
-    let current = get_runtime_status(state.clone());
+    let current = read_state(&state);
     let addr = current
         .server_address
         .clone()
@@ -93,7 +97,7 @@ fn complete_setup(
         admin_username,
         admin_password,
     };
-    let (mut hello, resp) = discovery::send_packet(&addr, &packet)?;
+    let (mut hello, resp) = discovery::send_packet(&addr, &packet).await?;
 
     match resp {
         ServerPacket::AuthSuccess {
@@ -117,20 +121,20 @@ fn complete_setup(
 }
 
 #[tauri::command]
-fn login_password(
+async fn login_password(
     app: AppHandle,
     username: String,
     password: String,
     state: State<'_, Mutex<ClientRuntimeStatus>>,
 ) -> Result<ClientRuntimeStatus, String> {
-    let current = get_runtime_status(state.clone());
+    let current = read_state(&state);
     let addr = current
         .server_address
         .clone()
         .ok_or("Not connected to a Core server")?;
 
     let packet = ClientPacket::LoginPassword { username, password };
-    let (hello, resp) = discovery::send_packet(&addr, &packet)?;
+    let (hello, resp) = discovery::send_packet(&addr, &packet).await?;
 
     match resp {
         ServerPacket::AuthSuccess {
@@ -153,17 +157,17 @@ fn login_password(
 }
 
 #[tauri::command]
-fn logout_user(
+async fn logout_user(
     app: AppHandle,
     state: State<'_, Mutex<ClientRuntimeStatus>>,
-) -> ClientRuntimeStatus {
-    let mut current = get_runtime_status(state.clone());
+) -> Result<ClientRuntimeStatus, String> {
+    let mut current = read_state(&state);
     if let Some(addr) = &current.server_address {
-        let _ = discovery::send_packet(addr, &ClientPacket::Logout);
+        let _ = discovery::send_packet(addr, &ClientPacket::Logout).await;
     }
     current.session_token = None;
     current.snapshot = None;
-    update_and_emit(&app, &state, current)
+    Ok(update_and_emit(&app, &state, current))
 }
 
 #[tauri::command]

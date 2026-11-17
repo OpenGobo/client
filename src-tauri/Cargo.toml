@@ -15,10 +15,14 @@ tauri-build = { version = "2.7.4", features = [] }
 
 [dependencies]
 opengobo-protocol = { git = "https://github.com/OpenGobo/core.git", branch = "main" }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = { version = "1.16.0", features = ["alloc"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tauri = { version = "2.12.5", features = [] }
 tauri-plugin-opener = "2.7.3"
+tokio = { version = "1.54.1", default-features = false, features = ["rt-multi-thread", "net", "time", "io-util", "sync"] }
 
 [profile.release]
 codegen-units = 1

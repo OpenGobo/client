@@ -1,8 +1,11 @@
 use opengobo_protocol::{ClientPacket, ServerHello, ServerPacket};
+use quinn::{ClientConfig, Endpoint};
+use quinn::crypto::rustls::QuicClientConfig;
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const DEFAULT_DISCOVERY_PORT: u16 = 9513;
@@ -76,65 +79,137 @@ pub fn scan_lan(timeout_ms: u64) -> Result<Vec<DiscoveredServer>, String> {
     Ok(found.into_values().collect())
 }
 
-fn open_stream(addr_str: &str) -> Result<TcpStream, String> {
-    let addr = addr_str
+#[derive(Debug)]
+struct SelfSignedCertVerifier(Arc<rustls::crypto::CryptoProvider>);
+
+impl SelfSignedCertVerifier {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(Arc::new(rustls::crypto::ring::default_provider())))
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for SelfSignedCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+async fn open_quic_connection(addr_str: &str) -> Result<(Endpoint, quinn::Connection), String> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let remote = addr_str
         .to_socket_addrs()
         .map_err(|e| e.to_string())?
         .next()
         .ok_or("Could not resolve server address")?;
 
-    let stream =
-        TcpStream::connect_timeout(&addr, Duration::from_millis(1500)).map_err(|e| e.to_string())?;
-    stream
-        .set_read_timeout(Some(Duration::from_millis(2000)))
+    let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
         .map_err(|e| e.to_string())?;
-    stream
-        .set_write_timeout(Some(Duration::from_millis(2000)))
+
+    let crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(SelfSignedCertVerifier::new())
+        .with_no_client_auth();
+    let quic_crypto = QuicClientConfig::try_from(crypto).map_err(|e| e.to_string())?;
+    endpoint.set_default_client_config(ClientConfig::new(Arc::new(quic_crypto)));
+
+    let connecting = endpoint
+        .connect(remote, "opengobo.local")
         .map_err(|e| e.to_string())?;
-    Ok(stream)
+    let conn = tokio::time::timeout(Duration::from_millis(2000), connecting)
+        .await
+        .map_err(|_| "QUIC connection timed out".to_string())?
+        .map_err(|e| e.to_string())?;
+
+    Ok((endpoint, conn))
 }
 
-pub fn probe_server(host: &str, port: u16) -> Result<ServerHello, String> {
-    let stream = open_stream(&format!("{host}:{port}"))?;
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).map_err(|e| e.to_string())?;
+pub async fn probe_server(host: &str, port: u16) -> Result<ServerHello, String> {
+    let (endpoint, conn) = open_quic_connection(&format!("{host}:{port}")).await?;
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
+    let _ = send.finish();
 
-    match serde_json::from_str::<ServerPacket>(&line).map_err(|e| e.to_string())? {
+    let raw = recv.read_to_end(65_536).await.map_err(|e| e.to_string())?;
+    conn.close(0u32.into(), b"probe");
+    endpoint.wait_idle().await;
+
+    let first_line = raw.split(|&b| b == b'\n').next().unwrap_or(&raw);
+    match serde_json::from_slice::<ServerPacket>(first_line).map_err(|e| e.to_string())? {
         ServerPacket::Hello(hello) => Ok(hello),
         _ => Err("Unexpected handshake packet from server".to_string()),
     }
 }
 
-pub fn send_packet(
+pub async fn send_packet(
     server_address: &str,
     packet: &ClientPacket,
 ) -> Result<(ServerHello, ServerPacket), String> {
-    let mut stream = open_stream(server_address)?;
-    let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+    let (endpoint, conn) = open_quic_connection(server_address).await?;
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
 
-    let mut hello_line = String::new();
-    reader
-        .read_line(&mut hello_line)
-        .map_err(|e| e.to_string())?;
+    let mut payload = serde_json::to_vec(packet).map_err(|e| e.to_string())?;
+    payload.push(b'\n');
+    send.write_all(&payload).await.map_err(|e| e.to_string())?;
+    send.finish().map_err(|e| e.to_string())?;
+
+    let raw = recv.read_to_end(131_072).await.map_err(|e| e.to_string())?;
+    conn.close(0u32.into(), b"done");
+    endpoint.wait_idle().await;
+
+    let mut lines = raw
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.trim_ascii().is_empty());
+
+    let hello_bytes = lines.next().ok_or("Missing ServerHello on QUIC stream")?;
     let ServerPacket::Hello(hello) =
-        serde_json::from_str::<ServerPacket>(&hello_line).map_err(|e| e.to_string())?
+        serde_json::from_slice::<ServerPacket>(hello_bytes).map_err(|e| e.to_string())?
     else {
         return Err("Expected ServerHello packet".to_string());
     };
 
-    let mut payload = serde_json::to_string(packet).map_err(|e| e.to_string())?;
-    payload.push('\n');
-    stream
-        .write_all(payload.as_bytes())
-        .map_err(|e| e.to_string())?;
-    stream.flush().map_err(|e| e.to_string())?;
-
-    let mut resp_line = String::new();
-    reader
-        .read_line(&mut resp_line)
-        .map_err(|e| e.to_string())?;
-    let resp = serde_json::from_str::<ServerPacket>(&resp_line).map_err(|e| e.to_string())?;
+    let resp_bytes = lines
+        .next()
+        .ok_or("Missing response packet on QUIC stream")?;
+    let resp = serde_json::from_slice::<ServerPacket>(resp_bytes).map_err(|e| e.to_string())?;
 
     Ok((hello, resp))
 }
