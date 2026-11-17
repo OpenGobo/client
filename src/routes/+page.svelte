@@ -116,54 +116,79 @@
 </script>
 
 {#if screenNumber !== null}
-  <main style="padding: 16px;">
-    <h2>Screen {screenNumber}</h2>
-    <button onpointerdown={backToLauncher}>Screen Setup</button>
+  <main class="h-screen w-screen bg-bg p-4 text-text">
+    <div class="flex items-center justify-between border-b border-border pb-3">
+      <span class="text-sm font-medium text-muted">Screen {screenNumber}</span>
+      <button
+        type="button"
+        class="rounded border border-border bg-surface px-3 py-1.5 text-sm text-text active:bg-surface-2"
+        onpointerdown={backToLauncher}
+      >
+        Screen Setup
+      </button>
+    </div>
   </main>
 {:else}
-  <main style="padding: 16px;">
-    <h3>Select Screens</h3>
+  <main class="flex min-h-screen flex-col justify-between bg-bg p-4 text-sm text-text">
+    <div class="space-y-3">
+      <h1 class="text-sm font-semibold text-text">Select Screens</h1>
 
-    {#each monitors as m (m.index)}
-      {@const slot = selected.indexOf(m.index)}
-      <div>
-        <label>
-          <input
-            type="checkbox"
-            checked={slot !== -1}
-            onchange={() => toggleMonitor(m.index)}
-          />
-          {#if slot !== -1}
-            <strong>[Screen {slot + 1}]</strong>
-          {/if}
-          {m.name} ({m.width}x{m.height})
-        </label>
-        {#if slot !== -1 && selected.length > 1}
-          <button type="button" disabled={slot === 0} onclick={() => moveMonitor(slot, -1)}>
-            ↑
-          </button>
-          <button
-            type="button"
-            disabled={slot === selected.length - 1}
-            onclick={() => moveMonitor(slot, 1)}
-          >
-            ↓
-          </button>
-        {/if}
+      <div class="space-y-1.5">
+        {#each monitors as m (m.index)}
+          {@const slot = selected.indexOf(m.index)}
+          <div class="flex items-center justify-between gap-2 rounded border border-border bg-surface px-2.5 py-2">
+            <label class="flex flex-1 items-center gap-2">
+              <input
+                type="checkbox"
+                checked={slot !== -1}
+                onchange={() => toggleMonitor(m.index)}
+              />
+              {#if slot !== -1}
+                <span class="rounded bg-surface-2 px-1.5 py-0.5 text-xs text-accent">
+                  #{slot + 1}
+                </span>
+              {/if}
+              <span>{m.name}</span>
+              <span class="text-xs text-muted">{m.width}×{m.height}</span>
+            </label>
+
+            {#if slot !== -1 && selected.length > 1}
+              <div class="flex gap-1">
+                <button
+                  type="button"
+                  class="rounded border border-border bg-surface-2 px-2 py-0.5 text-xs disabled:opacity-30"
+                  disabled={slot === 0}
+                  onclick={() => moveMonitor(slot, -1)}
+                >
+                  ↑
+                </button>
+                <button
+                  type="button"
+                  class="rounded border border-border bg-surface-2 px-2 py-0.5 text-xs disabled:opacity-30"
+                  disabled={slot === selected.length - 1}
+                  onclick={() => moveMonitor(slot, 1)}
+                >
+                  ↓
+                </button>
+              </div>
+            {/if}
+          </div>
+        {/each}
       </div>
-    {/each}
 
-    <div style="margin-top: 12px;">
-      <label>
+      <label class="flex items-center gap-2 pt-1 text-muted">
         <input type="checkbox" bind:checked={fullscreen} />
         Fullscreen
       </label>
     </div>
 
-    <div style="margin-top: 16px;">
-      <button disabled={selected.length === 0} onclick={start}>
-        Start ({selected.length})
-      </button>
-    </div>
+    <button
+      type="button"
+      class="mt-4 w-full rounded border border-border bg-surface-2 py-2 text-sm font-medium text-text active:bg-surface disabled:opacity-40"
+      disabled={selected.length === 0}
+      onclick={start}
+    >
+      Start ({selected.length})
+    </button>
   </main>
 {/if}
