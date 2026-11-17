@@ -485,6 +485,7 @@ dependencies = [
 name = "client"
 version = "0.1.0"
 dependencies = [
+ "opengobo-protocol",
  "serde",
  "serde_json",
  "tauri",
@@ -2393,6 +2394,17 @@ dependencies = [
  "dunce",
  "is-wsl",
  "libc",
+]
+
+[[package]]
+name = "opengobo-protocol"
+version = "0.1.0"
+source = "git+https://github.com/OpenGobo/core.git?branch=main#f95ab4981f0bbaa91d8e748005b7dca322cc3745"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "uuid",
 ]
 
 [[package]]
