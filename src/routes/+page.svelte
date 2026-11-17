@@ -11,10 +11,41 @@
     is_primary: boolean;
   }
 
+  interface DiscoveredServer {
+    server_id: string;
+    host: string;
+    port: number;
+    show_title: string;
+    protocol_version: number;
+    setup_mode_required: boolean;
+  }
+
+  interface ClientRuntimeStatus {
+    protocol_version: number;
+    connected: boolean;
+    server_address: string | null;
+    server_hello: {
+      protocol_version: number;
+      show_title: string;
+      setup_mode_required: boolean;
+    } | null;
+  }
+
   let screenNumber = $state<number | null>(null);
   let monitors = $state<MonitorInfo[]>([]);
   let selected = $state<number[]>([0]);
   let fullscreen = $state(true);
+
+  let servers = $state<DiscoveredServer[]>([]);
+  let selectedServerId = $state<string | null>(null);
+  let scanning = $state(false);
+  let status = $state<ClientRuntimeStatus>({
+    protocol_version: 1,
+    connected: false,
+    server_address: null,
+    server_hello: null,
+  });
+  let errorMsg = $state<string | null>(null);
 
   function toggleMonitor(index: number) {
     if (selected.includes(index)) {
@@ -32,8 +63,39 @@
     selected = copy;
   }
 
+  async function scanServers() {
+    scanning = true;
+    errorMsg = null;
+    try {
+      const list = await invoke<DiscoveredServer[]>("discover_servers");
+      servers = list;
+      if (list.length > 0 && ! list.some((s) => s.server_id === selectedServerId)) {
+        selectedServerId = list[0].server_id;
+      }
+    } catch (e) {
+      errorMsg = String(e);
+    } finally {
+      scanning = false;
+    }
+  }
+
   async function start() {
     if (selected.length === 0) return;
+    errorMsg = null;
+
+    const chosenServer = servers.find((s) => s.server_id === selectedServerId);
+    if (chosenServer) {
+      try {
+        status = await invoke<ClientRuntimeStatus>("connect_server", {
+          host: chosenServer.host,
+          port: chosenServer.port,
+        });
+      } catch (e) {
+        errorMsg = String(e);
+        return;
+      }
+    }
+
     await invoke("launch_screens", {
       selectedMonitors: selected,
       fullscreen,
@@ -49,6 +111,9 @@
     const s = params.get("screen");
     if (s) {
       screenNumber = Number(s);
+      invoke<ClientRuntimeStatus>("get_runtime_status").then((st) => {
+        status = st;
+      });
     } else {
       invoke<MonitorInfo[]>("list_monitors").then((list) => {
         monitors = list;
@@ -56,6 +121,10 @@
           selected = [list[0].index];
         }
       });
+      invoke<ClientRuntimeStatus>("get_runtime_status").then((st) => {
+        status = st;
+      });
+      scanServers();
     }
   });
 
@@ -118,68 +187,131 @@
 {#if screenNumber !== null}
   <main class="h-screen w-screen bg-bg p-4 text-text">
     <div class="flex items-center justify-between border-b border-border pb-3">
-      <span class="text-sm font-medium text-muted">Screen {screenNumber}</span>
+      <div class="flex items-center gap-3 text-sm">
+        <span class="font-medium text-muted">Screen {screenNumber}</span>
+        {#if status.connected && status.server_hello}
+          <span class="rounded bg-surface px-2 py-0.5 text-xs text-ok">
+            {status.server_hello.show_title} ({status.server_address})
+          </span>
+          {#if status.server_hello.setup_mode_required}
+            <span class="rounded bg-surface-2 px-2 py-0.5 text-xs text-accent">
+              Setup PIN Required
+            </span>
+          {/if}
+        {:else}
+          <span class="rounded bg-surface px-2 py-0.5 text-xs text-muted">
+            Offline
+          </span>
+        {/if}
+      </div>
+
       <button
         type="button"
         class="rounded border border-border bg-surface px-3 py-1.5 text-sm text-text active:bg-surface-2"
         onpointerdown={backToLauncher}
       >
-        Screen Setup
+        Setup
       </button>
     </div>
   </main>
 {:else}
   <main class="flex min-h-screen flex-col justify-between bg-bg p-4 text-sm text-text">
-    <div class="space-y-3">
-      <h1 class="text-sm font-semibold text-text">Select Screens</h1>
+    <div class="space-y-4">
+      <section class="space-y-2">
+        <div class="flex items-center justify-between">
+          <h2 class="text-xs font-semibold uppercase tracking-wider text-muted">Core Server</h2>
+          <button
+            type="button"
+            class="rounded border border-border bg-surface px-2 py-0.5 text-xs text-text active:bg-surface-2 disabled:opacity-40"
+            disabled={scanning}
+            onclick={scanServers}
+          >
+            {scanning ? "Scanning..." : "Refresh"}
+          </button>
+        </div>
 
-      <div class="space-y-1.5">
-        {#each monitors as m (m.index)}
-          {@const slot = selected.indexOf(m.index)}
-          <div class="flex items-center justify-between gap-2 rounded border border-border bg-surface px-2.5 py-2">
-            <label class="flex flex-1 items-center gap-2">
-              <input
-                type="checkbox"
-                checked={slot !== -1}
-                onchange={() => toggleMonitor(m.index)}
-              />
-              {#if slot !== -1}
-                <span class="rounded bg-surface-2 px-1.5 py-0.5 text-xs text-accent">
-                  #{slot + 1}
-                </span>
-              {/if}
-              <span>{m.name}</span>
-              <span class="text-xs text-muted">{m.width}×{m.height}</span>
-            </label>
-
-            {#if slot !== -1 && selected.length > 1}
-              <div class="flex gap-1">
-                <button
-                  type="button"
-                  class="rounded border border-border bg-surface-2 px-2 py-0.5 text-xs disabled:opacity-30"
-                  disabled={slot === 0}
-                  onclick={() => moveMonitor(slot, -1)}
-                >
-                  ↑
-                </button>
-                <button
-                  type="button"
-                  class="rounded border border-border bg-surface-2 px-2 py-0.5 text-xs disabled:opacity-30"
-                  disabled={slot === selected.length - 1}
-                  onclick={() => moveMonitor(slot, 1)}
-                >
-                  ↓
-                </button>
-              </div>
-            {/if}
+        {#if servers.length === 0}
+          <div class="rounded border border-border bg-surface px-3 py-2 text-xs text-muted">
+            {scanning ? "Searching LAN for OpenGobo Core..." : "No Core servers found"}
           </div>
-        {/each}
-      </div>
+        {:else}
+          <div class="space-y-1.5">
+            {#each servers as srv (srv.server_id)}
+              <button
+                type="button"
+                class="flex w-full items-center justify-between rounded border px-2.5 py-2 text-left {selectedServerId === srv.server_id ? 'border-accent bg-surface-2' : 'border-border bg-surface'}"
+                onclick={() => (selectedServerId = srv.server_id)}
+              >
+                <div>
+                  <div class="font-medium text-text">{srv.show_title}</div>
+                  <div class="text-xs text-muted">{srv.host}:{srv.port}</div>
+                </div>
+                {#if srv.setup_mode_required}
+                  <span class="rounded bg-bg px-1.5 py-0.5 text-xs text-accent">Setup</span>
+                {/if}
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </section>
 
-      <label class="flex items-center gap-2 pt-1 text-muted">
-        <input type="checkbox" bind:checked={fullscreen} />
-        Fullscreen
-      </label>
+      <section class="space-y-2">
+        <h2 class="text-xs font-semibold uppercase tracking-wider text-muted">Screens</h2>
+
+        <div class="space-y-1.5">
+          {#each monitors as m (m.index)}
+            {@const slot = selected.indexOf(m.index)}
+            <div class="flex items-center justify-between gap-2 rounded border border-border bg-surface px-2.5 py-2">
+              <label class="flex flex-1 items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={slot !== -1}
+                  onchange={() => toggleMonitor(m.index)}
+                />
+                {#if slot !== -1}
+                  <span class="rounded bg-surface-2 px-1.5 py-0.5 text-xs text-accent">
+                    #{slot + 1}
+                  </span>
+                {/if}
+                <span>{m.name}</span>
+                <span class="text-xs text-muted">{m.width}×{m.height}</span>
+              </label>
+
+              {#if slot !== -1 && selected.length > 1}
+                <div class="flex gap-1">
+                  <button
+                    type="button"
+                    class="rounded border border-border bg-surface-2 px-2 py-0.5 text-xs disabled:opacity-30"
+                    disabled={slot === 0}
+                    onclick={() => moveMonitor(slot, -1)}
+                  >
+                    ↑
+                  </button>
+                  <button
+                    type="button"
+                    class="rounded border border-border bg-surface-2 px-2 py-0.5 text-xs disabled:opacity-30"
+                    disabled={slot === selected.length - 1}
+                    onclick={() => moveMonitor(slot, 1)}
+                  >
+                    ↓
+                  </button>
+                </div>
+              {/if}
+            </div>
+          {/each}
+        </div>
+
+        <label class="flex items-center gap-2 pt-1 text-muted">
+          <input type="checkbox" bind:checked={fullscreen} />
+          Fullscreen
+        </label>
+      </section>
+
+      {#if errorMsg}
+        <div class="rounded border border-danger bg-surface px-2.5 py-1.5 text-xs text-danger">
+          {errorMsg}
+        </div>
+      {/if}
     </div>
 
     <button

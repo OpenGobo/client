@@ -13,8 +13,8 @@
     "windows": [
       {
         "title": "OpenGobo Startup",
-        "width": 420,
-        "height": 320,
+        "width": 440,
+        "height": 460,
         "resizable": false,
         "center": true
       }
