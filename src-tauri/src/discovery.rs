@@ -1,7 +1,7 @@
-use opengobo_protocol::{ServerHello, ServerPacket};
+use opengobo_protocol::{ClientPacket, ServerHello, ServerPacket};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -76,8 +76,8 @@ pub fn scan_lan(timeout_ms: u64) -> Result<Vec<DiscoveredServer>, String> {
     Ok(found.into_values().collect())
 }
 
-pub fn probe_server(host: &str, port: u16) -> Result<ServerHello, String> {
-    let addr = format!("{host}:{port}")
+fn open_stream(addr_str: &str) -> Result<TcpStream, String> {
+    let addr = addr_str
         .to_socket_addrs()
         .map_err(|e| e.to_string())?
         .next()
@@ -86,9 +86,16 @@ pub fn probe_server(host: &str, port: u16) -> Result<ServerHello, String> {
     let stream =
         TcpStream::connect_timeout(&addr, Duration::from_millis(1500)).map_err(|e| e.to_string())?;
     stream
-        .set_read_timeout(Some(Duration::from_millis(1500)))
+        .set_read_timeout(Some(Duration::from_millis(2000)))
         .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(2000)))
+        .map_err(|e| e.to_string())?;
+    Ok(stream)
+}
 
+pub fn probe_server(host: &str, port: u16) -> Result<ServerHello, String> {
+    let stream = open_stream(&format!("{host}:{port}"))?;
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line).map_err(|e| e.to_string())?;
@@ -97,4 +104,37 @@ pub fn probe_server(host: &str, port: u16) -> Result<ServerHello, String> {
         ServerPacket::Hello(hello) => Ok(hello),
         _ => Err("Unexpected handshake packet from server".to_string()),
     }
+}
+
+pub fn send_packet(
+    server_address: &str,
+    packet: &ClientPacket,
+) -> Result<(ServerHello, ServerPacket), String> {
+    let mut stream = open_stream(server_address)?;
+    let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+
+    let mut hello_line = String::new();
+    reader
+        .read_line(&mut hello_line)
+        .map_err(|e| e.to_string())?;
+    let ServerPacket::Hello(hello) =
+        serde_json::from_str::<ServerPacket>(&hello_line).map_err(|e| e.to_string())?
+    else {
+        return Err("Expected ServerHello packet".to_string());
+    };
+
+    let mut payload = serde_json::to_string(packet).map_err(|e| e.to_string())?;
+    payload.push('\n');
+    stream
+        .write_all(payload.as_bytes())
+        .map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())?;
+
+    let mut resp_line = String::new();
+    reader
+        .read_line(&mut resp_line)
+        .map_err(|e| e.to_string())?;
+    let resp = serde_json::from_str::<ServerPacket>(&resp_line).map_err(|e| e.to_string())?;
+
+    Ok((hello, resp))
 }

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
 
   interface MonitorInfo {
     index: number;
@@ -20,6 +21,15 @@
     setup_mode_required: boolean;
   }
 
+  interface ShowSnapshot {
+    show_title: string;
+    user: {
+      id: string;
+      username: string;
+      roles: string[];
+    };
+  }
+
   interface ClientRuntimeStatus {
     protocol_version: number;
     connected: boolean;
@@ -29,6 +39,8 @@
       show_title: string;
       setup_mode_required: boolean;
     } | null;
+    session_token: string | null;
+    snapshot: ShowSnapshot | null;
   }
 
   let screenNumber = $state<number | null>(null);
@@ -44,8 +56,16 @@
     connected: false,
     server_address: null,
     server_hello: null,
+    session_token: null,
+    snapshot: null,
   });
   let errorMsg = $state<string | null>(null);
+
+  let setupPin = $state("");
+  let username = $state("");
+  let password = $state("");
+  let authBusy = $state(false);
+  let authError = $state<string | null>(null);
 
   function toggleMonitor(index: number) {
     if (selected.includes(index)) {
@@ -69,7 +89,7 @@
     try {
       const list = await invoke<DiscoveredServer[]>("discover_servers");
       servers = list;
-      if (list.length > 0 && ! list.some((s) => s.server_id === selectedServerId)) {
+      if (list.length > 0 && !list.some((s) => s.server_id === selectedServerId)) {
         selectedServerId = list[0].server_id;
       }
     } catch (e) {
@@ -102,6 +122,46 @@
     });
   }
 
+  async function submitSetup(e: Event) {
+    e.preventDefault();
+    authBusy = true;
+    authError = null;
+    try {
+      status = await invoke<ClientRuntimeStatus>("complete_setup", {
+        setupPin,
+        adminUsername: username,
+        adminPassword: password,
+      });
+      setupPin = "";
+      password = "";
+    } catch (err) {
+      authError = String(err);
+    } finally {
+      authBusy = false;
+    }
+  }
+
+  async function submitLogin(e: Event) {
+    e.preventDefault();
+    authBusy = true;
+    authError = null;
+    try {
+      status = await invoke<ClientRuntimeStatus>("login_password", {
+        username,
+        password,
+      });
+      password = "";
+    } catch (err) {
+      authError = String(err);
+    } finally {
+      authBusy = false;
+    }
+  }
+
+  async function handleLogout() {
+    status = await invoke<ClientRuntimeStatus>("logout_user");
+  }
+
   async function backToLauncher() {
     await invoke("reopen_launcher");
   }
@@ -126,6 +186,15 @@
       });
       scanServers();
     }
+
+    const unlistenPromise = listen<ClientRuntimeStatus>("runtime-status", (ev) => {
+      status = ev.payload;
+      authError = null;
+    });
+
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
   });
 
   // Harden browser/touch behavior so nothing interrupts live show operation
@@ -185,34 +254,154 @@
 </script>
 
 {#if screenNumber !== null}
-  <main class="h-screen w-screen bg-bg p-4 text-text">
-    <div class="flex items-center justify-between border-b border-border pb-3">
+  <main class="flex h-screen w-screen flex-col bg-bg p-4 text-text">
+    <header class="flex items-center justify-between border-b border-border pb-3">
       <div class="flex items-center gap-3 text-sm">
         <span class="font-medium text-muted">Screen {screenNumber}</span>
         {#if status.connected && status.server_hello}
           <span class="rounded bg-surface px-2 py-0.5 text-xs text-ok">
             {status.server_hello.show_title} ({status.server_address})
           </span>
-          {#if status.server_hello.setup_mode_required}
-            <span class="rounded bg-surface-2 px-2 py-0.5 text-xs text-accent">
-              Setup PIN Required
-            </span>
-          {/if}
         {:else}
-          <span class="rounded bg-surface px-2 py-0.5 text-xs text-muted">
-            Offline
-          </span>
+          <span class="rounded bg-surface px-2 py-0.5 text-xs text-muted">Offline</span>
         {/if}
       </div>
 
-      <button
-        type="button"
-        class="rounded border border-border bg-surface px-3 py-1.5 text-sm text-text active:bg-surface-2"
-        onpointerdown={backToLauncher}
-      >
-        Setup
-      </button>
-    </div>
+      <div class="flex items-center gap-2">
+        {#if status.snapshot}
+          <span class="text-xs text-muted">{status.snapshot.user.username}</span>
+          <button
+            type="button"
+            class="rounded border border-border bg-surface px-3 py-1.5 text-xs text-text active:bg-surface-2"
+            onpointerdown={handleLogout}
+          >
+            Logout
+          </button>
+        {/if}
+        <button
+          type="button"
+          class="rounded border border-border bg-surface px-3 py-1.5 text-xs text-text active:bg-surface-2"
+          onpointerdown={backToLauncher}
+        >
+          Setup
+        </button>
+      </div>
+    </header>
+
+    {#if status.connected && status.server_hello && !status.snapshot}
+      <div class="flex flex-1 items-center justify-center">
+        {#if status.server_hello.setup_mode_required}
+          <form
+            class="w-full max-w-sm space-y-3 rounded border border-border bg-surface p-5"
+            onsubmit={submitSetup}
+          >
+            <div>
+              <h2 class="text-base font-semibold text-text">First-Time Server Setup</h2>
+              <p class="mt-0.5 text-xs text-muted">
+                Enter the 6-digit Setup PIN shown in the Core server terminal to create the initial
+                Admin account.
+              </p>
+            </div>
+
+            <div class="space-y-1">
+              <label for="setup-pin" class="block text-xs text-muted">Setup PIN</label>
+              <input
+                id="setup-pin"
+                type="text"
+                inputmode="numeric"
+                autocomplete="off"
+                placeholder="e.g. 123456"
+                bind:value={setupPin}
+                class="w-full rounded border border-border bg-bg px-3 py-2 text-sm text-text outline-none focus:border-accent"
+              />
+            </div>
+
+            <div class="space-y-1">
+              <label for="setup-user" class="block text-xs text-muted">Admin Username</label>
+              <input
+                id="setup-user"
+                type="text"
+                autocomplete="off"
+                placeholder="admin"
+                bind:value={username}
+                class="w-full rounded border border-border bg-bg px-3 py-2 text-sm text-text outline-none focus:border-accent"
+              />
+            </div>
+
+            <div class="space-y-1">
+              <label for="setup-pass" class="block text-xs text-muted">Admin Password / PIN</label>
+              <input
+                id="setup-pass"
+                type="password"
+                autocomplete="off"
+                bind:value={password}
+                class="w-full rounded border border-border bg-bg px-3 py-2 text-sm text-text outline-none focus:border-accent"
+              />
+            </div>
+
+            {#if authError}
+              <div class="rounded border border-danger bg-bg px-2.5 py-1.5 text-xs text-danger">
+                {authError}
+              </div>
+            {/if}
+
+            <button
+              type="submit"
+              disabled={authBusy || !setupPin.trim() || !username.trim() || !password}
+              class="w-full rounded border border-border bg-surface-2 py-2 text-sm font-medium text-text active:bg-bg disabled:opacity-40"
+            >
+              {authBusy ? "Creating Admin..." : "Complete Setup"}
+            </button>
+          </form>
+        {:else}
+          <form
+            class="w-full max-w-sm space-y-3 rounded border border-border bg-surface p-5"
+            onsubmit={submitLogin}
+          >
+            <div>
+              <h2 class="text-base font-semibold text-text">Login</h2>
+              <p class="mt-0.5 text-xs text-muted">{status.server_hello.show_title}</p>
+            </div>
+
+            <div class="space-y-1">
+              <label for="login-user" class="block text-xs text-muted">Username</label>
+              <input
+                id="login-user"
+                type="text"
+                autocomplete="off"
+                bind:value={username}
+                class="w-full rounded border border-border bg-bg px-3 py-2 text-sm text-text outline-none focus:border-accent"
+              />
+            </div>
+
+            <div class="space-y-1">
+              <label for="login-pass" class="block text-xs text-muted">Password / PIN</label>
+              <input
+                id="login-pass"
+                type="password"
+                autocomplete="off"
+                bind:value={password}
+                class="w-full rounded border border-border bg-bg px-3 py-2 text-sm text-text outline-none focus:border-accent"
+              />
+            </div>
+
+            {#if authError}
+              <div class="rounded border border-danger bg-bg px-2.5 py-1.5 text-xs text-danger">
+                {authError}
+              </div>
+            {/if}
+
+            <button
+              type="submit"
+              disabled={authBusy || !username.trim() || !password}
+              class="w-full rounded border border-border bg-surface-2 py-2 text-sm font-medium text-text active:bg-bg disabled:opacity-40"
+            >
+              {authBusy ? "Signing in..." : "Login"}
+            </button>
+          </form>
+        {/if}
+      </div>
+    {/if}
   </main>
 {:else}
   <main class="flex min-h-screen flex-col justify-between bg-bg p-4 text-sm text-text">
