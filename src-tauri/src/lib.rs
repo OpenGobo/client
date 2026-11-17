@@ -1,14 +1,16 @@
 pub mod discovery;
 pub mod display;
 
-use discovery::DiscoveredServer;
+use discovery::{ActiveQuicSession, DiscoveredServer, SessionEvent, apply_delta_to_snapshot};
 use display::MonitorInfo;
 use opengobo_protocol::{
     ClientCommand, ClientPacket, PROTOCOL_VERSION, ServerHello, ServerPacket, ShowSnapshot,
 };
 use serde::Serialize;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
+use tokio::sync::oneshot;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClientRuntimeStatus {
@@ -33,25 +35,54 @@ impl Default for ClientRuntimeStatus {
     }
 }
 
-fn read_state(state: &State<'_, Mutex<ClientRuntimeStatus>>) -> ClientRuntimeStatus {
-    state.lock().map(|s| s.clone()).unwrap_or_default()
+#[derive(Default)]
+pub struct ClientManager {
+    pub status: Arc<Mutex<ClientRuntimeStatus>>,
+    pub session: Mutex<Option<ActiveQuicSession>>,
+    pub next_request_id: Mutex<u64>,
 }
 
-fn update_and_emit(
+fn read_status(mgr: &ClientManager) -> ClientRuntimeStatus {
+    mgr.status.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+fn set_status_and_emit(
     app: &AppHandle,
-    state: &State<'_, Mutex<ClientRuntimeStatus>>,
+    status_arc: &Arc<Mutex<ClientRuntimeStatus>>,
     next: ClientRuntimeStatus,
 ) -> ClientRuntimeStatus {
-    if let Ok(mut guard) = state.lock() {
+    if let Ok(mut guard) = status_arc.lock() {
         *guard = next.clone();
     }
     let _ = app.emit("runtime-status", &next);
     next
 }
 
+async fn send_over_session(
+    mgr: &State<'_, ClientManager>,
+    packet: ClientPacket,
+) -> Result<ServerPacket, String> {
+    let tx = mgr
+        .session
+        .lock()
+        .map_err(|_| "Session state lock poisoned".to_string())?
+        .as_ref()
+        .map(|s| s.tx.clone())
+        .ok_or("No active QUIC session")?;
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send((packet, reply_tx))
+        .map_err(|_| "QUIC session channel closed".to_string())?;
+
+    tokio::time::timeout(Duration::from_millis(3000), reply_rx)
+        .await
+        .map_err(|_| "Timed out waiting for Core response".to_string())?
+        .map_err(|_| "QUIC response channel dropped".to_string())?
+}
+
 #[tauri::command]
-fn get_runtime_status(state: State<'_, Mutex<ClientRuntimeStatus>>) -> ClientRuntimeStatus {
-    read_state(&state)
+fn get_runtime_status(mgr: State<'_, ClientManager>) -> ClientRuntimeStatus {
+    read_status(&mgr)
 }
 
 #[tauri::command]
@@ -64,18 +95,58 @@ async fn connect_server(
     app: AppHandle,
     host: String,
     port: u16,
-    state: State<'_, Mutex<ClientRuntimeStatus>>,
+    mgr: State<'_, ClientManager>,
 ) -> Result<ClientRuntimeStatus, String> {
-    let hello = discovery::probe_server(&host, port).await?;
+    if let Ok(mut old) = mgr.session.lock()
+        && let Some(prev) = old.take()
+    {
+        let _ = prev.stop_tx.send(true);
+    }
+
+    let addr = format!("{host}:{port}");
+    let status_arc = Arc::clone(&mgr.status);
+    let app_clone = app.clone();
+
+    let (hello, session) = discovery::start_persistent_session(addr.clone(), move |ev| {
+        let mut current = status_arc.lock().map(|s| s.clone()).unwrap_or_default();
+        match ev {
+            SessionEvent::ConnectionChanged { connected, hello } => {
+                current.connected = connected;
+                if let Some(h) = hello {
+                    current.server_hello = Some(h);
+                }
+            }
+            SessionEvent::Reauthenticated {
+                session_token,
+                snapshot,
+            } => {
+                current.connected = true;
+                current.session_token = Some(session_token);
+                current.snapshot = Some(*snapshot);
+            }
+            SessionEvent::Delta(delta) => {
+                if let Some(ref mut snap) = current.snapshot {
+                    apply_delta_to_snapshot(snap, delta);
+                }
+            }
+        }
+        set_status_and_emit(&app_clone, &status_arc, current);
+    })
+    .await?;
+
+    if let Ok(mut guard) = mgr.session.lock() {
+        *guard = Some(session);
+    }
+
     let next = ClientRuntimeStatus {
         protocol_version: PROTOCOL_VERSION,
         connected: true,
-        server_address: Some(format!("{host}:{port}")),
+        server_address: Some(addr),
         server_hello: Some(hello),
         session_token: None,
         snapshot: None,
     };
-    Ok(update_and_emit(&app, &state, next))
+    Ok(set_status_and_emit(&app, &mgr.status, next))
 }
 
 #[tauri::command]
@@ -84,36 +155,27 @@ async fn complete_setup(
     setup_pin: String,
     admin_username: String,
     admin_password: String,
-    state: State<'_, Mutex<ClientRuntimeStatus>>,
+    mgr: State<'_, ClientManager>,
 ) -> Result<ClientRuntimeStatus, String> {
-    let current = read_state(&state);
-    let addr = current
-        .server_address
-        .clone()
-        .ok_or("Not connected to a Core server")?;
-
     let packet = ClientPacket::CompleteSetup {
         setup_pin,
         admin_username,
         admin_password,
     };
-    let (mut hello, resp) = discovery::send_packet(&addr, &packet).await?;
+    let resp = send_over_session(&mgr, packet).await?;
 
     match resp {
         ServerPacket::AuthSuccess {
             session_token,
             snapshot,
         } => {
-            hello.setup_mode_required = false;
-            let next = ClientRuntimeStatus {
-                protocol_version: PROTOCOL_VERSION,
-                connected: true,
-                server_address: Some(addr),
-                server_hello: Some(hello),
-                session_token: Some(session_token),
-                snapshot: Some(*snapshot),
-            };
-            Ok(update_and_emit(&app, &state, next))
+            let mut next = read_status(&mgr);
+            if let Some(ref mut h) = next.server_hello {
+                h.setup_mode_required = false;
+            }
+            next.session_token = Some(session_token);
+            next.snapshot = Some(*snapshot);
+            Ok(set_status_and_emit(&app, &mgr.status, next))
         }
         ServerPacket::AuthError { message } => Err(message),
         _ => Err("Unexpected response from Core server".to_string()),
@@ -125,31 +187,20 @@ async fn login_password(
     app: AppHandle,
     username: String,
     password: String,
-    state: State<'_, Mutex<ClientRuntimeStatus>>,
+    mgr: State<'_, ClientManager>,
 ) -> Result<ClientRuntimeStatus, String> {
-    let current = read_state(&state);
-    let addr = current
-        .server_address
-        .clone()
-        .ok_or("Not connected to a Core server")?;
-
     let packet = ClientPacket::LoginPassword { username, password };
-    let (hello, resp) = discovery::send_packet(&addr, &packet).await?;
+    let resp = send_over_session(&mgr, packet).await?;
 
     match resp {
         ServerPacket::AuthSuccess {
             session_token,
             snapshot,
         } => {
-            let next = ClientRuntimeStatus {
-                protocol_version: PROTOCOL_VERSION,
-                connected: true,
-                server_address: Some(addr),
-                server_hello: Some(hello),
-                session_token: Some(session_token),
-                snapshot: Some(*snapshot),
-            };
-            Ok(update_and_emit(&app, &state, next))
+            let mut next = read_status(&mgr);
+            next.session_token = Some(session_token);
+            next.snapshot = Some(*snapshot);
+            Ok(set_status_and_emit(&app, &mgr.status, next))
         }
         ServerPacket::AuthError { message } => Err(message),
         _ => Err("Unexpected response from Core server".to_string()),
@@ -157,25 +208,64 @@ async fn login_password(
 }
 
 #[tauri::command]
+async fn send_command(
+    command: ClientCommand,
+    mgr: State<'_, ClientManager>,
+) -> Result<(), String> {
+    let request_id = {
+        let mut id_guard = mgr
+            .next_request_id
+            .lock()
+            .map_err(|_| "Lock poisoned".to_string())?;
+        *id_guard = id_guard.saturating_add(1);
+        *id_guard
+    };
+
+    let resp = send_over_session(
+        &mgr,
+        ClientPacket::Command {
+            request_id,
+            command,
+        },
+    )
+    .await?;
+
+    match resp {
+        ServerPacket::CommandResponse {
+            accepted: true, ..
+        } => Ok(()),
+        ServerPacket::CommandResponse {
+            accepted: false,
+            error,
+            ..
+        } => Err(error.unwrap_or_else(|| "Command rejected".to_string())),
+        _ => Err("Unexpected command response".to_string()),
+    }
+}
+
+#[tauri::command]
 async fn logout_user(
     app: AppHandle,
-    state: State<'_, Mutex<ClientRuntimeStatus>>,
+    mgr: State<'_, ClientManager>,
 ) -> Result<ClientRuntimeStatus, String> {
-    let mut current = read_state(&state);
-    if let Some(addr) = &current.server_address {
-        let _ = discovery::send_packet(addr, &ClientPacket::Logout).await;
-    }
+    let _ = send_over_session(&mgr, ClientPacket::Logout).await;
+    let mut current = read_status(&mgr);
     current.session_token = None;
     current.snapshot = None;
-    Ok(update_and_emit(&app, &state, current))
+    Ok(set_status_and_emit(&app, &mgr.status, current))
 }
 
 #[tauri::command]
 fn disconnect_server(
     app: AppHandle,
-    state: State<'_, Mutex<ClientRuntimeStatus>>,
+    mgr: State<'_, ClientManager>,
 ) -> ClientRuntimeStatus {
-    update_and_emit(&app, &state, ClientRuntimeStatus::default())
+    if let Ok(mut old) = mgr.session.lock()
+        && let Some(prev) = old.take()
+    {
+        let _ = prev.stop_tx.send(true);
+    }
+    set_status_and_emit(&app, &mgr.status, ClientRuntimeStatus::default())
 }
 
 #[tauri::command]
@@ -205,7 +295,7 @@ fn reopen_launcher(app: AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(Mutex::new(ClientRuntimeStatus::default()))
+        .manage(ClientManager::default())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_runtime_status,
@@ -213,6 +303,7 @@ pub fn run() {
             connect_server,
             complete_setup,
             login_password,
+            send_command,
             logout_user,
             disconnect_server,
             validate_command,
