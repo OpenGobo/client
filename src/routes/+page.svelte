@@ -167,22 +167,3 @@
     </div>
   </main>
 {/if}
-
-<style>
-  :global(html, body) {
-    overscroll-behavior: none;
-    touch-action: manipulation;
-  }
-
-  :global(*) {
-    user-select: none;
-    -webkit-user-select: none;
-    -webkit-touch-callout: none;
-    -webkit-user-drag: none;
-  }
-
-  :global(input, textarea) {
-    user-select: text;
-    -webkit-user-select: text;
-  }
-</style>
